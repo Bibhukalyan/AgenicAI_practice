@@ -1,0 +1,124 @@
+import os
+import json
+import requests
+import certifi
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+# 1) Client for Gemini via OpenAI-compatible endpoint
+openai_gemini_client = OpenAI(
+    api_key=os.getenv("GEMINI_KEY"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+# 2) Tool implementation (return string instead of print, so the model can use it)
+def get_weather(city: str) -> str:
+    if not city or not isinstance(city, str):
+        return "Invalid city name."
+    url = f"http://wttr.in/{city.lower()}?format=%C+%t"
+    try:
+        response = requests.get(url, timeout=10, verify=certifi.where())
+        if response.status_code == 200:
+            return f"Weather in {city} is {response.text.strip()}"
+        else:
+            return f"Could not retrieve weather data for {city}. HTTP {response.status_code}"
+    except requests.RequestException as e:
+        return f"Error retrieving weather for {city}: {e}"
+
+# 3) Tool schema (must match the function name exactly)
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get a quick current weather summary for a given city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "City name, e.g., 'Delhi' or 'Bengaluru'.",
+                    }
+                },
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+# Optional: map tool names to local callables if you add more tools later
+TOOL_ROUTER = {
+    "get_weather": get_weather
+}
+
+# 4) Small agent loop: lets the model decide to call tools, executes, and returns final answer
+def run_agent(user_message: str) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant. If the user asks about current weather, "
+                "use the get_weather tool. After using a tool, summarize the result clearly."
+            ),
+        },
+        {"role": "user", "content": user_message},
+    ]
+
+    # First turn: allow tool calls
+    resp = openai_gemini_client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0.2,
+    )
+    msg = resp.choices[0].message
+
+    # While the model wants to call tools, fulfill them
+    while getattr(msg, "tool_calls", None):
+        for tc in msg.tool_calls:
+            if tc.type == "function":
+                func_name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                # Dispatch to the correct local function
+                if func_name in TOOL_ROUTER:
+                    result = TOOL_ROUTER[func_name](**args)
+                else:
+                    result = f"Tool '{func_name}' not found."
+
+                # Append tool result back to the conversation
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,  # IMPORTANT: tie result to the specific tool call
+                    "name": func_name,
+                    "content": result
+                })
+
+        # Ask the model to use the tool results and produce a final answer
+        resp = openai_gemini_client.chat.completions.create(
+            model="gemini-2.5-flash",
+            messages=messages,
+            temperature=0.2,
+        )
+        msg = resp.choices[0].message
+
+        # If model triggers more tool calls, the while loop continues; else we break
+        if not getattr(msg, "tool_calls", None):
+            break
+
+    # If no tool call was needed, msg.content already contains the answer
+    return msg.content or ""
+
+# 5) Demo: pure text vs. tool usage
+if __name__ == "__main__":
+    print("\n--- Example: plain prompt (no tools) ---")
+    print(run_agent("Write hello in Hindi"))
+
+    print("\n--- Example: weather (tool call expected) ---")
+    print(run_agent("What's the weather in Delhi right now?"))
